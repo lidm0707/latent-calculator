@@ -5,6 +5,7 @@
 //! discount/tax) and decodes the result symbolically. No learned weights,
 //! zero dependencies, no feature flags.
 
+pub mod expr;
 pub mod latex;
 pub mod tokenizer;
 pub mod transformer;

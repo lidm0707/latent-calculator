@@ -90,6 +90,16 @@ the sentence to the client — no WASM bundle cost for the math.
 |---|---|---|
 | `3 time each item 20$ total` | `total is 60$` | total cost |
 | `5 plus 3` | `sum is 8` | arithmetic |
+| `3 + 4 * 2` | `result is 11` | expression (precedence) |
+| `(1 + 2) * 3` | `result is 9` | expression (parens) |
+| `-3 + 2` | `sum is -1` | expression (unary minus) |
+| `sin(pi / 2)` | `result is 1` | function call |
+| `sqrt(2)` | `result is 1.414213562` | function call |
+| `2 ^ 3 ^ 2` | `result is 512` | power (right-assoc) |
+| `-2 ^ 2` | `result is -4` | power binds tighter than unary `-` |
+| `2 pi` | `product is 6.283185307` | implicit multiplication |
+| `2(3)` | `product is 6` | implicit multiplication |
+| `abs(-5)` | `result is 5` | function call |
 | `10$ discount 2%` | `result is 9.8$` | percent-price |
 | `2 buy 1` | `sum is 3` | NL word → `+` |
 | `I have 2 dogs and one is die` | `difference is 1 dog` | NL word → `−` (death/loss verb), noun retained |
@@ -97,6 +107,23 @@ the sentence to the client — no WASM bundle cost for the math.
 | `\frac{6}{2}` | `quotient is 3` | LaTeX division |
 | `\sqrt[3]{27}` | `root is 3` | LaTeX k-th root |
 | `why 2 dog and 1 cat` | _not a math question_ | plausibility gate |
+| `sin(x + 0.001)` | _not a math question_ | reject don't-guess (unsolvable: free var) |
+| `lim x->0 of sin(x)` | `limit is 0` | limit by substitution |
+| `lim x->2 of x^2` | `limit is 4` | limit by substitution |
+| `lim x->0 of (sin(x+0.001)-sin(x))/0.001` | `limit is 0.999999833` | limit (≈ cos(0)) |
+| `lim x->0 of sin(x)/x` | _not a math question_ | reject (0/0 singular, no CAS) |
+| `derivative of x^2` | _not a math question_ | reject (calculus, no symbolic) |
+
+### What it does NOT do (yet)
+
+LatCal is a numeric calculator, not a computer-algebra system. It will tell you when
+it can't handle something instead of guessing:
+
+- **No symbolic math** — free variables (`x`, `alpha`) and equation solving are out of scope (a `lim` variable is substituted, not solved symbolically).
+- **No symbolic calculus** — `derivative`/`integral` are rejected. `lim VAR -> POINT of EXPR` is supported **by closed-form substitution** (it evaluates `EXPR` at `POINT`); singular limits like `sin(x)/x` at 0 produce `0/0` and are honestly rejected as `not a math question`.
+- **No `÷`-free juxtaposition** — `2(3)` *is* implicit multiplication, but two bare number literals `2 3` stay ambiguous (use `2 * 3`).
+
+Functions supported: `sin` `cos` `tan` `asin` `acos` `atan` `sqrt` `log` (base-10) `ln` `exp` `abs` `floor` `ceil`. Constants: `pi` `e`. Operators: `+ - * / ^` (and `× ÷`), with implicit multiplication for `2 pi`, `2(3)`, `(2)(3)`. Power is right-associative and binds tighter than unary minus (`-2^2 = -4`).
 
 ### Natural-language operation vocabulary
 
@@ -133,8 +160,9 @@ latent engine:
 | `\left(` `\right)` | `( )` | sized delimiters (qualifier dropped) |
 
 Unknown commands are passed through verbatim, so LaTeX-free input is unaffected.
-_Note: operator precedence and juxtaposition-as-multiplication (`2\frac{1}{2}`) are
-not modeled — keep one operator per query._
+_Note: pure arithmetic expressions are evaluated by a dedicated recursive-descent
+parser with full operator precedence, parentheses, and unary minus. Juxtaposition-
+as-multiplication (`2\frac{1}{2}`) is not modeled._
 
 ---
 
@@ -154,10 +182,11 @@ See [`src/lib.rs`](src/lib.rs) for the full re-export list (`Token`, `ArithOp`,
 `Currency`, `CurrencySide`, `Answer`). LaTeX expansion is available directly as
 `latent_calculator::latex::expand`.
 
-### Architecture — 4 files
+### Architecture — 5 files
 
 ```
 src/
+  expr.rs        recursive-descent arithmetic evaluator (precedence, parens, unary minus)
   tokenizer.rs   lexical classification (numbers, currency, percent, ops, count-units, roots)
   latex.rs       LaTeX arithmetic preprocessor (\frac / \sqrt / \times / \div / \pi / escapes)
   transformer.rs neuro-symbolic latent-space engine (the brain)
@@ -165,9 +194,15 @@ src/
   lib.rs         thin re-exports
 ```
 
-Pipeline: `input → latex::expand → tokens → embed → attend → Latent → decode → Answer`.
+Pipeline: `input → latex::expand → limit (substitute & eval) → expr fast-path (if pure arithmetic) → tokens → embed → attend → Latent → decode → Answer`.
 
 - **`latex::expand`** — rewrites the LaTeX subset into tokenizer-friendly forms (no-op when no `\`).
+- **limit** — `lim VAR -> POINT of EXPR` is solved by substituting `POINT` for `VAR` and running the expr evaluator. No symbolic math: a singular limit (`sin(x)/x` at 0) yields `0/0` and is rejected as `NotMath`. Self-gates — only matches the `lim`/`limit` prefix with a non-colliding variable.
+- **`expr` fast-path** — if the expanded input is a complete arithmetic expression with ≥1
+  operator, a recursive-descent parser evaluates it with precedence, parentheses, and unary
+  minus. It self-gates (the lexer rejects letters/`%`/currency), so natural-language input
+  falls through to the latent engine unchanged. A single binary op keeps its specific label
+  (`sum`/`difference`/`product`/`quotient`); a compound expression reports `result`.
 - **`embed`** — gathers latent operand slots (quantities, prices, numbers, percents, roots) + flags.
 - **`attend`** — **linear attention, hand-set (no training)**: `features` embeds the
   latent `State` into a vector `φ ∈ R^18`; every applicable operation class is
@@ -202,7 +237,7 @@ root is 3
 ## Build & test
 
 ```sh
-cargo test     -p latent-calculator        # 36 tests (27 unit + 9 integration), no flags
+cargo test     -p latent-calculator        # 97 tests, no flags
 cargo clippy   -p latent-calculator --all-targets
 ```
 

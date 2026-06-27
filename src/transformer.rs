@@ -80,6 +80,39 @@ pub struct Calculator;
 impl Calculator {
     pub fn parse(input: &str) -> Result<Answer, ParseError> {
         let expanded = crate::latex::expand(input);
+        // Numerical limit via closed-form substitution: `lim VAR -> POINT of EXPR`
+        // is evaluated by substituting POINT for VAR and running the expression
+        // evaluator. No symbolic math — a singular limit (e.g. sin(x)/x at 0)
+        // produces 0/0 and is honestly rejected as `NotMath`.
+        if let Some(limit) = try_limit(&expanded) {
+            let value = limit?;
+            return Ok(Answer {
+                value,
+                label: "limit",
+                currency: None,
+                side: CurrencySide::Suffix,
+                unit: None,
+            });
+        }
+        // Pure-arithmetic fast path: a complete expression with ≥1 operator
+        // (precedence, parens, unary minus). Self-gates via the lexer — anything
+        // with letters, currency, or percent falls through to the NL classifier.
+        if let Some((value, label)) = crate::expr::evaluate_labelled(&expanded) {
+            return Ok(Answer {
+                value,
+                label,
+                currency: None,
+                side: CurrencySide::Suffix,
+                unit: None,
+            });
+        }
+        // Reject don't-guess: if the input looks like a structured math
+        // expression (operators, parens, a known function, or a calculus term)
+        // but the evaluator could not solve it, do NOT let the NL classifier
+        // rescue a lone number out of the soup. Say "not math" instead.
+        if looks_structured(&expanded) {
+            return Err(ParseError::NotMath);
+        }
         let tokens = tokenize(&expanded);
         let state = embed(&tokens);
         // Plausibility gate: no math anchor surrounded by noise → NotMath.
@@ -754,6 +787,151 @@ fn is_math_keyword(w: &str) -> bool {
         || matches!(w.to_ascii_lowercase().as_str(), "double" | "triple")
 }
 
+// ── Numerical limit by substitution ─────────────────────────
+//
+// `lim VAR -> POINT of EXPR` (or `limit`, or the `→` arrow) is evaluated by
+// substituting POINT for VAR in EXPR and running the arithmetic evaluator.
+// This is the only honest thing a modelless numeric calculator can do with a
+// limit: it gives the value of the expression at the point. A singular limit
+// (0/0, ln(0), ...) yields no value and is rejected as `NotMath`.
+
+/// Returns `Some(Ok(value))` if `s` is a limit form that evaluates to a number,
+/// `Some(Err(NotMath))` if it is a limit form that cannot be evaluated (e.g.
+/// 0/0 at the point), and `None` if `s` is not a limit form at all.
+fn try_limit(s: &str) -> Option<Result<f64, ParseError>> {
+    let (var, point, expr) = parse_limit_form(s)?;
+    let substituted = substitute_var(expr, var, point);
+    match crate::expr::evaluate(&substituted) {
+        Some(v) => Some(Ok(v)),
+        None => Some(Err(ParseError::NotMath)),
+    }
+}
+
+/// Structural parse of `lim VAR -> POINT of EXPR`. Returns `(var, point, expr)`
+/// as slices borrowed from `s`, or `None` when the prefix does not match. `VAR`
+/// must be an alphabetic run that is not a known function/constant, otherwise it
+/// would corrupt the substituted expression (e.g. `lim e -> 0 of e`).
+fn parse_limit_form(s: &str) -> Option<(&str, &str, &str)> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    // Keyword: "limit" or "lim", case-insensitive, followed by whitespace.
+    let kw = if b.len() >= 5 && b[..5].eq_ignore_ascii_case(b"limit") {
+        5
+    } else if b.len() >= 3 && b[..3].eq_ignore_ascii_case(b"lim") {
+        3
+    } else {
+        return None;
+    };
+    let mut i = skip_ws(b, kw);
+    if i == kw {
+        return None; // keyword not followed by whitespace (e.g. "limbo")
+    }
+    // Variable: an ASCII letter run. Must not collide with a known ident.
+    let var_start = i;
+    while i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == var_start || crate::expr::is_known_ident(&s[var_start..i]) {
+        return None;
+    }
+    let var = &s[var_start..i];
+    i = skip_ws(b, i);
+    // Arrow: "->" or the unicode "→".
+    if s[i..].starts_with("->") {
+        i += 2;
+    } else if s[i..].starts_with('→') {
+        i += '→'.len_utf8();
+    } else {
+        return None;
+    }
+    i = skip_ws(b, i);
+    // Limit point: the next non-whitespace run (number, signed number, or a
+    // constant like `pi`/`e`). Validated later by the expression evaluator.
+    let pt_start = i;
+    while i < b.len() && !b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == pt_start {
+        return None;
+    }
+    let point = &s[pt_start..i];
+    i = skip_ws(b, i);
+    // "of" keyword, case-insensitive, followed by whitespace.
+    if i + 2 > b.len() || !b[i..i + 2].eq_ignore_ascii_case(b"of") {
+        return None;
+    }
+    let after_of = skip_ws(b, i + 2);
+    if after_of == i + 2 || after_of >= b.len() {
+        return None; // no whitespace after "of", or no expression
+    }
+    Some((var, point, &s[after_of..]))
+}
+
+/// Replace every whole-word occurrence of `var` in `expr` with `(point)`,
+/// preserving operator precedence. Word boundaries are ASCII alphanumeric, so
+/// `x` inside `exp` or `0.001` is never touched.
+fn substitute_var(expr: &str, var: &str, point: &str) -> String {
+    let v = var.as_bytes();
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let right_ok = i + v.len() <= bytes.len()
+            && (i + v.len() == bytes.len() || !bytes[i + v.len()].is_ascii_alphanumeric());
+        if left_ok && right_ok && &bytes[i..i + v.len()] == v {
+            out.push('(');
+            out.push_str(point);
+            out.push(')');
+            i += v.len();
+        } else {
+            let c = expr[i..].chars().next().expect("non-empty slice");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Structured-expression signals on the raw (post-LaTeX) string. If any are
+/// present, the input was attempting to be a math expression/function call;
+/// when the evaluator rejects it, the NL classifier must not guess from it.
+const STRUCT_SYMBOLS: &[char] = &['+', '-', '/', '*', '×', '÷', '(', ')', '\\'];
+const CALCULUS_WORDS: &[&str] = &[
+    "lim",
+    "limit",
+    "derivative",
+    "differentiate",
+    "integral",
+    "integrate",
+    "dx",
+    "dy",
+];
+const SUPPORTED_FUNCS: &[&str] = &["sin", "cos", "tan", "sqrt", "log", "ln", "exp"];
+
+fn looks_structured(s: &str) -> bool {
+    if s.contains("->") || s.chars().any(|c| STRUCT_SYMBOLS.contains(&c)) {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    for word in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        if CALCULUS_WORDS.contains(&word) || SUPPORTED_FUNCS.contains(&word) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +995,46 @@ mod tests {
     fn rejects_non_math_noise() {
         assert_eq!(run("why 2 dog and 1 cat"), Err(ParseError::NotMath));
         assert_eq!(run("the quick brown fox"), Err(ParseError::NotMath));
+    }
+
+    #[test]
+    fn limit_by_substitution() {
+        // Closed-form substitution: lim VAR -> POINT of EXPR == EXPR at POINT.
+        assert_eq!(
+            run("lim x->0 of sin(x)").unwrap().to_sentence(),
+            "limit is 0"
+        );
+        assert_eq!(
+            run("lim x->2 of x ^ 2").unwrap().to_sentence(),
+            "limit is 4"
+        );
+        assert_eq!(run("lim x->0 of 1").unwrap().to_sentence(), "limit is 1");
+        // The forward-difference approximation of cos(0): the expression as
+        // written evaluates to ~1 at x = 0.
+        let fwd = run("lim x->0 of (sin(x + 0.001) - sin(x)) / 0.001").unwrap();
+        assert!(fwd.to_sentence().starts_with("limit is "));
+        assert!((fwd.value - 1.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn limit_accepts_arrow_and_keyword_variants() {
+        assert_eq!(run("limit x->3 of x").unwrap().to_sentence(), "limit is 3");
+        assert_eq!(run("lim x → 3 of x").unwrap().to_sentence(), "limit is 3");
+        assert_eq!(
+            run("lim x -> -1 of x + 1").unwrap().to_sentence(),
+            "limit is 0"
+        );
+    }
+
+    #[test]
+    fn limit_rejects_singular_and_non_limit_forms() {
+        // 0/0 at the point: honest rejection, never a guessed lone number.
+        assert_eq!(run("lim x->0 of sin(x) / x"), Err(ParseError::NotMath));
+        assert_eq!(run("lim x->0 of 1 / x"), Err(ParseError::NotMath));
+        // Variable colliding with a known ident is not treated as a limit.
+        assert_eq!(run("lim e->0 of e"), Err(ParseError::NotMath));
+        // Malformed limit syntax (no `of`) still hits the calculus gate.
+        assert_eq!(run("lim x->0"), Err(ParseError::NotMath));
     }
 
     #[test]
