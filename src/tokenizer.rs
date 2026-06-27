@@ -56,6 +56,11 @@ pub enum Token<'a> {
     Percent,
     Times,
     Op(ArithOp),
+    /// k-th root produced by LaTeX `\sqrt[k]{n}` (square root when k = 2).
+    Root {
+        index: f64,
+        radicand: f64,
+    },
     Word(&'a str),
 }
 
@@ -114,6 +119,9 @@ fn classify(s: &str) -> Option<Token<'_>> {
     if let Some(v) = percent_value_token(s) {
         return Some(Token::PercentValue(v));
     }
+    if let Some((index, radicand)) = root_token(s) {
+        return Some(Token::Root { index, radicand });
+    }
     if let Some(q) = quantity_token(s) {
         return Some(Token::Quantity(q));
     }
@@ -166,6 +174,17 @@ fn currency_token(s: &str) -> Option<(f64, Currency, CurrencySide)> {
         return Some((v, cur, CurrencySide::Suffix));
     }
     None
+}
+
+fn root_token(s: &str) -> Option<(f64, f64)> {
+    let inner = s.strip_prefix("root{")?.strip_suffix('}')?;
+    let mut it = inner.split(',');
+    let index = parse_num(it.next()?)?;
+    let radicand = parse_num(it.next()?)?;
+    if it.next().is_some() || index <= 0.0 {
+        return None;
+    }
+    Some((index, radicand))
 }
 
 fn percent_value_token(s: &str) -> Option<f64> {

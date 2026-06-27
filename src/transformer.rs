@@ -19,7 +19,10 @@ use crate::tokenizer::{ArithOp, Currency, CurrencySide, Token, is_count_unit, to
 
 // ── Natural-language operation vocabulary ──────────────────────
 const NL_ADD: &[&str] = &["buy", "get", "gain", "receive"];
-const NL_SUB: &[&str] = &["eat", "lose", "give", "take", "spend", "drop"];
+const NL_SUB: &[&str] = &[
+    "eat", "lose", "loses", "lost", "give", "take", "spend", "drop", "die", "died", "dies", "dead",
+    "death", "gone", "kill", "killed", "remove", "removed", "fewer",
+];
 const NL_DISCOUNT: &[&str] = &["discount", "off", "sale", "save"];
 const NL_TAX: &[&str] = &["tax", "tip", "vat"];
 const MATH_KEYWORDS: &[&str] = &[
@@ -74,7 +77,8 @@ pub struct Calculator;
 
 impl Calculator {
     pub fn parse(input: &str) -> Result<Answer, ParseError> {
-        let tokens = tokenize(input);
+        let expanded = crate::latex::expand(input);
+        let tokens = tokenize(&expanded);
         let state = embed(&tokens);
         // Plausibility gate: no math anchor surrounded by noise → NotMath.
         if !has_anchor(&state) && has_noise(&tokens) {
@@ -127,6 +131,10 @@ enum Latent {
         currency: Option<Currency>,
         side: CurrencySide,
     },
+    Root {
+        index: f64,
+        radicand: f64,
+    },
     Unknown,
 }
 
@@ -143,6 +151,7 @@ struct State {
     quantities: Vec<f64>,
     prices: Vec<(f64, Currency)>,
     numbers: Vec<f64>,
+    roots: Vec<(f64, f64)>,
     ops: Vec<ArithOp>,             // explicit operator tokens
     nl_op: Option<ArithOp>,        // NL operation word (buy/eat/…) — weaker than explicit ops
     unary: Option<(ArithOp, f64)>, // double/triple → (Mul, implicit operand)
@@ -201,6 +210,7 @@ fn embed(tokens: &[Token<'_>]) -> State {
             Token::Percent => s.has_percent = true,
             Token::Op(op) => s.ops.push(*op),
             Token::Times => s.ops.push(ArithOp::Mul),
+            Token::Root { index, radicand } => s.roots.push((*index, *radicand)),
             Token::Word(w) => classify_word(w, &mut s),
         }
         i += 1;
@@ -259,6 +269,13 @@ fn attend(s: &State) -> Latent {
             currency: s.currency,
             side: s.side,
         };
+    }
+    if let Some((index, radicand)) = s.roots.first().copied()
+        && s.ops.is_empty()
+        && s.nl_op.is_none()
+        && s.unary.is_none()
+    {
+        return Latent::Root { index, radicand };
     }
     let arith_op = s.ops.first().copied().or(s.nl_op);
     if let Some(op) = arith_op {
@@ -417,6 +434,14 @@ fn decode(l: &Latent) -> Option<(f64, &'static str, Option<Currency>, CurrencySi
             currency,
             side,
         } => Some((*value, "result", *currency, *side)),
+        Latent::Root { index, radicand } => {
+            let v = radicand.powf(1.0 / index);
+            if v.is_finite() {
+                Some((v, "root", None, CurrencySide::Suffix))
+            } else {
+                None
+            }
+        }
         Latent::Unknown => None,
     }
 }
@@ -543,7 +568,7 @@ mod tests {
 
     #[test]
     fn rejects_non_math_noise() {
-        assert_eq!(run("why 2 dog and die 1"), Err(ParseError::NotMath));
+        assert_eq!(run("why 2 dog and 1 cat"), Err(ParseError::NotMath));
         assert_eq!(run("the quick brown fox"), Err(ParseError::NotMath));
     }
 
@@ -556,5 +581,26 @@ mod tests {
     #[test]
     fn ambiguous_terse_is_unknown() {
         assert_eq!(run("20 30"), Err(ParseError::Unknown));
+    }
+
+    #[test]
+    fn natural_language_subtraction() {
+        // "I have 2 dogs and one died" -> 2 - 1 = 1 remains.
+        assert_eq!(
+            run("I have 2 dogs and one is die").unwrap().to_sentence(),
+            "difference is 1"
+        );
+        assert_eq!(
+            run("5 apples lost 2").unwrap().to_sentence(),
+            "difference is 3"
+        );
+    }
+
+    #[test]
+    fn latex_arithmetic() {
+        assert_eq!(run("\\frac{6}{2}").unwrap().to_sentence(), "quotient is 3");
+        assert_eq!(run("3 \\times 4").unwrap().to_sentence(), "product is 12");
+        assert_eq!(run("\\sqrt{9}").unwrap().to_sentence(), "root is 3");
+        assert_eq!(run("\\sqrt[3]{27}").unwrap().to_sentence(), "root is 3");
     }
 }

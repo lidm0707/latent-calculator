@@ -1,4 +1,5 @@
-//! Integration test: the user's spec example must round-trip to "total is 60$".
+//! Integration tests: the spec example, NL subtraction (the dogs example),
+//! and the LaTeX arithmetic subset.
 
 use latent_calculator::{Calculator, Currency, CurrencySide};
 
@@ -58,7 +59,6 @@ fn percent_of() {
 
 #[test]
 fn discount_and_tax() {
-    // `price discount pct%` ⇒ final price after discount.
     assert_eq!(
         Calculator::parse("10$ discount 2%").unwrap().to_sentence(),
         "result is 9.8$"
@@ -69,9 +69,56 @@ fn discount_and_tax() {
             .to_sentence(),
         "result is 80$"
     );
-    // `price tax pct%` ⇒ final price after tax.
     assert_eq!(
         Calculator::parse("50$ tax 10%").unwrap().to_sentence(),
         "result is 55$"
+    );
+}
+
+#[test]
+fn natural_language_subtraction_dogs() {
+    // The headline NL example: broken English, possession + death verb.
+    assert_eq!(
+        Calculator::parse("I have 2 dogs and one is die")
+            .unwrap()
+            .to_sentence(),
+        "difference is 1"
+    );
+}
+
+#[test]
+fn latex_frac_times_div() {
+    assert_eq!(
+        Calculator::parse("\\frac{6}{2}").unwrap().to_sentence(),
+        "quotient is 3"
+    );
+    assert_eq!(
+        Calculator::parse("\\frac{100}{4}").unwrap().to_sentence(),
+        "quotient is 25"
+    );
+    assert_eq!(
+        Calculator::parse("3 \\times 4").unwrap().to_sentence(),
+        "product is 12"
+    );
+    assert_eq!(
+        Calculator::parse("12 \\div 3").unwrap().to_sentence(),
+        "quotient is 4"
+    );
+}
+
+#[test]
+fn latex_sqrt() {
+    assert_eq!(
+        Calculator::parse("\\sqrt{9}").unwrap().to_sentence(),
+        "root is 3"
+    );
+    assert_eq!(
+        Calculator::parse("\\sqrt[3]{27}").unwrap().to_sentence(),
+        "root is 3"
+    );
+    // \pi expands to the f64 constant; sqrt snaps to 9 decimals.
+    assert_eq!(
+        Calculator::parse("\\sqrt{\\pi}").unwrap().to_sentence(),
+        "root is 1.772453851"
     );
 }
