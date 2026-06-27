@@ -327,73 +327,221 @@ fn pick_noun(units: &[String], value: f64) -> Option<String> {
     }
 }
 
-// ── attend: read the operation + operands out of the latent state ──
+// ── latent vector + linear attention (hand-set, no training) ──
+//
+// `features` embeds the latent `State` into a real vector φ ∈ R^N. Each
+// operation class owns a hand-set weight row; `attend` scores every
+// *applicable* class by the dot product w·φ and takes the argmax. A tiny
+// per-class prior (the Bias feature) carries the legacy priority order as a
+// deterministic tie-breaker. No learned weights — φ and W are hand-set.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpClass {
+    PercentPrice = 0,
+    PercentOf = 1,
+    Average = 2,
+    TotalCost = 3,
+    Unary = 4,
+    Root = 5,
+    Arith = 6,
+    Sum = 7,
+    Single = 8,
+    Unknown = 9,
+}
+const N_CLASSES: usize = 10;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Feature {
+    HasTax = 0,
+    HasDiscount = 1,
+    HasPercent = 2,
+    HasOf = 3,
+    HasAvg = 4,
+    HasTotal = 5,
+    HasSum = 6,
+    HasRoot = 7,
+    HasExplicitOp = 8,
+    HasNlOp = 9,
+    HasUnary = 10,
+    HasPrice = 11,
+    HasQty = 12,
+    HasNumber = 13,
+    TwoPlusNumbers = 14,
+    OneValue = 15,
+    TwoPlusValues = 16,
+    Bias = 17,
+}
+const N_FEATURES: usize = 18;
+
+const WEIGHTS: [[f64; N_FEATURES]; N_CLASSES] = [
+    [
+        3.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.10,
+    ], // PercentPrice
+    [
+        0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.09,
+    ], // PercentOf
+    [
+        0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 0.08,
+    ], // Average
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.07,
+    ], // TotalCost
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.06,
+    ], // Unary
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05,
+    ], // Root
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.04,
+    ], // Arith
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.03,
+    ], // Sum
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.02,
+    ], // Single
+    [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01,
+    ], // Unknown
+];
+
+fn bit(b: bool) -> f64 {
+    if b { 1.0 } else { 0.0 }
+}
+
+fn features(s: &State) -> [f64; N_FEATURES] {
+    let values = value_list(s);
+    let mut f = [0.0; N_FEATURES];
+    f[Feature::HasTax as usize] = bit(s.has_tax);
+    f[Feature::HasDiscount as usize] = bit(s.has_discount);
+    f[Feature::HasPercent as usize] = bit(!s.percents.is_empty());
+    f[Feature::HasOf as usize] = bit(s.has_of);
+    f[Feature::HasAvg as usize] = bit(s.has_avg);
+    f[Feature::HasTotal as usize] = bit(s.has_total);
+    f[Feature::HasSum as usize] = bit(s.has_sum);
+    f[Feature::HasRoot as usize] = bit(!s.roots.is_empty());
+    f[Feature::HasExplicitOp as usize] = bit(!s.ops.is_empty());
+    f[Feature::HasNlOp as usize] = bit(s.nl_op.is_some());
+    f[Feature::HasUnary as usize] = bit(s.unary.is_some());
+    f[Feature::HasPrice as usize] = bit(!s.prices.is_empty());
+    f[Feature::HasQty as usize] = bit(!s.quantities.is_empty());
+    f[Feature::HasNumber as usize] = bit(!s.numbers.is_empty());
+    f[Feature::TwoPlusNumbers as usize] = bit(s.numbers.len() >= 2);
+    f[Feature::OneValue as usize] = bit(values.len() == 1);
+    f[Feature::TwoPlusValues as usize] = bit(values.len() >= 2);
+    f[Feature::Bias as usize] = 1.0;
+    f
+}
+
+fn score(class: OpClass, phi: &[f64; N_FEATURES]) -> f64 {
+    WEIGHTS[class as usize]
+        .iter()
+        .zip(phi.iter())
+        .map(|(w, x)| w * x)
+        .sum()
+}
 
 fn attend(s: &State) -> Latent {
-    if let Some(c) = try_percent_price(s) {
-        return c;
+    let phi = features(s);
+    let candidates: [(OpClass, Option<Latent>); N_CLASSES] = [
+        (OpClass::PercentPrice, try_percent_price(s)),
+        (OpClass::PercentOf, try_percent_of(s)),
+        (OpClass::Average, try_average(s)),
+        (OpClass::TotalCost, try_total_cost(s)),
+        (OpClass::Unary, try_unary(s)),
+        (OpClass::Root, try_root(s)),
+        (OpClass::Arith, try_arith(s)),
+        (OpClass::Sum, try_sum(s)),
+        (OpClass::Single, try_single(s)),
+        (OpClass::Unknown, Some(Latent::Unknown)),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(c, opt)| opt.map(|l| (c, l)))
+        .max_by(|(ca, _), (cb, _)| score(*ca, &phi).total_cmp(&score(*cb, &phi)))
+        .map(|(_, l)| l)
+        .unwrap_or(Latent::Unknown)
+}
+
+fn try_average(s: &State) -> Option<Latent> {
+    if !s.has_avg || s.numbers.is_empty() {
+        return None;
     }
-    if let Some(c) = try_percent_of(s) {
-        return c;
+    Some(Latent::Average {
+        values: s.numbers.clone(),
+    })
+}
+
+fn try_total_cost(s: &State) -> Option<Latent> {
+    if s.quantities.is_empty() || s.prices.is_empty() || !s.ops.is_empty() {
+        return None;
     }
-    if s.has_avg && !s.numbers.is_empty() {
-        return Latent::Average {
-            values: s.numbers.clone(),
-        };
+    Some(total_cost(s))
+}
+
+fn try_unary(s: &State) -> Option<Latent> {
+    let (op, implicit) = s.unary?;
+    let v = first_value(s)?;
+    Some(Latent::Arith {
+        op,
+        values: vec![v, implicit],
+        currency: s.currency,
+        side: s.side,
+    })
+}
+
+fn try_root(s: &State) -> Option<Latent> {
+    let (index, radicand) = s.roots.first().copied()?;
+    if !s.ops.is_empty() || s.nl_op.is_some() || s.unary.is_some() {
+        return None;
     }
-    // TotalCost wins over a bare NL op (so "I buy 3 at 20$ total" stays a total).
-    if !s.quantities.is_empty() && !s.prices.is_empty() && s.ops.is_empty() {
-        return total_cost(s);
+    Some(Latent::Root { index, radicand })
+}
+
+fn try_arith(s: &State) -> Option<Latent> {
+    let op = s.ops.first().copied().or(s.nl_op)?;
+    let values = value_list(s);
+    if values.len() < 2 {
+        return None;
     }
-    if let Some((op, implicit)) = s.unary
-        && let Some(v) = first_value(s)
-    {
-        return Latent::Arith {
-            op,
-            values: vec![v, implicit],
-            currency: s.currency,
-            side: s.side,
-        };
+    Some(Latent::Arith {
+        op,
+        values,
+        currency: s.currency,
+        side: s.side,
+    })
+}
+
+fn try_sum(s: &State) -> Option<Latent> {
+    if !(s.has_total || s.has_sum) {
+        return None;
     }
-    if let Some((index, radicand)) = s.roots.first().copied()
-        && s.ops.is_empty()
-        && s.nl_op.is_none()
-        && s.unary.is_none()
-    {
-        return Latent::Root { index, radicand };
+    let values = value_list(s);
+    if values.len() < 2 {
+        return None;
     }
-    let arith_op = s.ops.first().copied().or(s.nl_op);
-    if let Some(op) = arith_op {
-        let values = value_list(s);
-        if values.len() >= 2 {
-            return Latent::Arith {
-                op,
-                values,
-                currency: s.currency,
-                side: s.side,
-            };
-        }
-    }
-    if (s.has_total || s.has_sum) && value_list(s).len() >= 2 {
-        return Latent::Arith {
-            op: ArithOp::Add,
-            values: value_list(s),
-            currency: s.currency,
-            side: s.side,
-        };
-    }
+    Some(Latent::Arith {
+        op: ArithOp::Add,
+        values,
+        currency: s.currency,
+        side: s.side,
+    })
+}
+
+fn try_single(s: &State) -> Option<Latent> {
     match value_list(s).as_slice() {
-        [v] => Latent::Single {
+        [v] => Some(Latent::Single {
             value: *v,
             currency: s.currency,
             side: s.side,
-        },
-        [] if !s.prices.is_empty() => Latent::Single {
+        }),
+        [] if !s.prices.is_empty() => Some(Latent::Single {
             value: s.prices[0].0,
             currency: s.currency,
             side: s.side,
-        },
-        _ => Latent::Unknown,
+        }),
+        _ => None,
     }
 }
 
@@ -743,5 +891,52 @@ mod tests {
         assert_eq!(run("3 \\times 4").unwrap().to_sentence(), "product is 12");
         assert_eq!(run("\\sqrt{9}").unwrap().to_sentence(), "root is 3");
         assert_eq!(run("\\sqrt[3]{27}").unwrap().to_sentence(), "root is 3");
+    }
+
+    #[test]
+    fn vector_attention_picks_the_right_class() {
+        // The latent vector + linear attention must select the same operation the
+        // old priority chain did, including the Arith-over-Sum tie-break.
+        let phi = features(&embed(&tokenize("I have 2 dogs and one is die")));
+        let s = score(OpClass::Arith, &phi) - score(OpClass::Sum, &phi);
+        assert!(s > 0.0, "Arith must out-score Sum, got delta {s}");
+        assert_eq!(
+            run("I have 2 dogs and one is die").unwrap().label,
+            "difference"
+        );
+    }
+
+    /// Zero-dependency micro-bench of the full parse pipeline (tokenize →
+    /// embed → gate → vector-attend → decode). Run with:
+    ///   cargo test vector_attention_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn vector_attention_bench() {
+        use std::time::Instant;
+        let corpus = [
+            "I have 2 dogs and one dog is dead.",
+            "10 tax 7%",
+            "90 tax 8.8%",
+            "5 plus 3",
+            "average of 4 8 and 12",
+            "3 time each item 20$ total",
+            "double 15",
+            "\\sqrt[3]{27}",
+            "20",
+        ];
+        const ITERS: usize = 100_000;
+        let start = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..ITERS {
+            for q in corpus {
+                if let Ok(a) = Calculator::parse(q) {
+                    acc = acc.wrapping_add(a.value.to_bits());
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        let queries = ITERS * corpus.len();
+        let ns_per = elapsed.as_nanos() as f64 / queries as f64;
+        println!("bench: {queries} parses in {elapsed:?} = {ns_per:.0} ns/parse (sink={acc})");
     }
 }

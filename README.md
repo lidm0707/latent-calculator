@@ -169,13 +169,16 @@ Pipeline: `input → latex::expand → tokens → embed → attend → Latent �
 
 - **`latex::expand`** — rewrites the LaTeX subset into tokenizer-friendly forms (no-op when no `\`).
 - **`embed`** — gathers latent operand slots (quantities, prices, numbers, percents, roots) + flags.
-- **`attend`** — reads the operation + operands out of the latent state; NL operation
-  words compile into the op slot here.
+- **`attend`** — **linear attention, hand-set (no training)**: `features` embeds the
+  latent `State` into a vector `φ ∈ R^18`; every applicable operation class is
+  scored by a dot product `w·φ` with a hand-set weight row, and the argmax wins.
+  A tiny per-class prior carries the legacy priority order as a tie-breaker.
 - **`decode`** — symbolic arithmetic on the `Latent` (arithmetic, currency, percent, roots).
 - **Plausibility gate** — no math anchor + noise → `NotMath`.
 
-This split is what makes it neuro-symbolic: neural-style understanding (`embed` + `attend`)
-selects the operation and operands; `decode` does the arithmetic.
+This split is what makes it neuro-symbolic: a **real** latent vector + linear
+attention (`embed` + `attend`) selects the operation and operands; `decode` does
+the arithmetic. No learned weights anywhere — `φ` and the weight matrix are hand-set.
 
 ---
 
@@ -199,7 +202,7 @@ root is 3
 ## Build & test
 
 ```sh
-cargo test     -p latent-calculator        # 35 tests (26 unit + 9 integration), no flags
+cargo test     -p latent-calculator        # 36 tests (27 unit + 9 integration), no flags
 cargo clippy   -p latent-calculator --all-targets
 ```
 
