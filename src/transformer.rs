@@ -48,20 +48,22 @@ pub struct Answer {
     pub label: &'static str,
     pub currency: Option<Currency>,
     pub side: CurrencySide,
+    pub unit: Option<String>,
 }
 
 impl Answer {
     pub fn to_sentence(&self) -> String {
         let num = fmt_num(self.value);
-        match (self.currency, self.side) {
-            (Some(cur), CurrencySide::Suffix) => {
-                format!("{} is {}{}", self.label, num, cur.symbol())
-            }
-            (Some(cur), CurrencySide::Prefix) => {
-                format!("{} is {}{}", self.label, cur.symbol(), num)
-            }
-            (None, _) => format!("{} is {}", self.label, num),
-        }
+        let core = match (self.currency, self.side) {
+            (Some(cur), CurrencySide::Suffix) => format!("{}{}", num, cur.symbol()),
+            (Some(cur), CurrencySide::Prefix) => format!("{}{}", cur.symbol(), num),
+            (None, _) => num,
+        };
+        let with_unit = match &self.unit {
+            Some(u) => format!("{core} {u}"),
+            None => core,
+        };
+        format!("{} is {}", self.label, with_unit)
     }
 }
 
@@ -91,6 +93,7 @@ impl Calculator {
                 label,
                 currency,
                 side,
+                unit: pick_noun(&state.units, value),
             }),
             None => Err(ParseError::Unknown),
         }
@@ -165,6 +168,7 @@ struct State {
     has_tax: bool,
     currency: Option<Currency>,
     side: CurrencySide,
+    units: Vec<String>,
 }
 
 fn embed(tokens: &[Token<'_>]) -> State {
@@ -192,6 +196,12 @@ fn embed(tokens: &[Token<'_>]) -> State {
                     s.quantities.push(*n);
                     i += 2;
                     continue;
+                }
+                // capture a trailing count noun: "2 dogs", "5 apples".
+                if let Some(Token::Word(w)) = next
+                    && is_count_noun(w)
+                {
+                    s.units.push(w.to_ascii_lowercase());
                 }
                 s.numbers.push(*n);
             }
@@ -221,6 +231,18 @@ fn embed(tokens: &[Token<'_>]) -> State {
 /// Map a word token into the latent state: structural cues, percent-price
 /// directions, and NL operation words (compiled into the op slot).
 fn classify_word(w: &str, s: &mut State) {
+    // Recover numbers the strict tokenizer rejected: thousands separators
+    // ("30,211") or a number glued to a known keyword ("90tax"). Only commit
+    // when the suffix is empty or recognizable, so noise like "2@" stays noise.
+    if let Some((num, rest)) = loose_number(w)
+        && (rest.is_empty() || is_known_suffix(rest))
+    {
+        s.numbers.push(num);
+        if !rest.is_empty() {
+            classify_word(rest, s);
+        }
+        return;
+    }
     let lw = w.to_ascii_lowercase();
     match lw.as_str() {
         "of" => s.has_of = true,
@@ -239,6 +261,69 @@ fn classify_word(w: &str, s: &mut State) {
         "double" => s.unary = Some((ArithOp::Mul, 2.0)),
         "triple" => s.unary = Some((ArithOp::Mul, 3.0)),
         _ => {}
+    }
+}
+
+/// Read a number out of a word the tokenizer's strict `parse_num` rejected:
+/// thousands separators ("30,211") or a number glued to a keyword ("90tax").
+/// Returns the value plus the trailing suffix (empty for a pure number).
+fn loose_number(w: &str) -> Option<(f64, &str)> {
+    let bytes = w.as_bytes();
+    let mut end = 0;
+    let mut saw_digit = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                end = i + 1;
+            }
+            b',' | b'.' => {}
+            _ => break,
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+    let cleaned: String = w[..end].chars().filter(|&c| c != ',').collect();
+    let v = cleaned.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    Some((v, &w[end..]))
+}
+
+/// Only split a glued number when what follows is itself a meaningful token,
+/// so random punctuation glued to a digit doesn't get promoted into a rate.
+fn is_known_suffix(rest: &str) -> bool {
+    is_math_keyword(rest)
+        || is_count_unit(rest)
+        || rest == "%"
+        || rest.eq_ignore_ascii_case("percent")
+        || rest.eq_ignore_ascii_case("pct")
+}
+
+/// A bare alphabetic word that isn't an operator/unit keyword — i.e. a count
+/// noun like "dogs" or "apples" that should be echoed in the answer.
+fn is_count_noun(w: &str) -> bool {
+    !w.is_empty()
+        && w.chars().all(|c| c.is_ascii_alphabetic())
+        && !is_math_keyword(w)
+        && !is_count_unit(w)
+}
+
+/// Pick the noun to echo alongside the result: prefer a candidate already in
+/// the right grammatical number for `value`, and singularize (drop trailing
+/// 's') when the result is exactly 1.
+fn pick_noun(units: &[String], value: f64) -> Option<String> {
+    if units.is_empty() {
+        return None;
+    }
+    let singular = value == 1.0;
+    let preferred = units
+        .iter()
+        .find(|u| singular != u.ends_with('s'))
+        .or_else(|| units.first())?;
+    if singular && preferred.ends_with('s') && preferred.len() > 1 {
+        Some(preferred[..preferred.len() - 1].to_string())
+    } else {
+        Some(preferred.clone())
     }
 }
 
@@ -313,9 +398,6 @@ fn attend(s: &State) -> Latent {
 }
 
 fn try_percent_price(s: &State) -> Option<Latent> {
-    if s.percents.is_empty() || s.prices.is_empty() {
-        return None;
-    }
     let dir = if s.has_discount {
         PercentDir::Discount
     } else if s.has_tax {
@@ -323,12 +405,29 @@ fn try_percent_price(s: &State) -> Option<Latent> {
     } else {
         return None;
     };
-    let (price, cur) = s.prices[0];
+
+    // Base: prefer a currency price, otherwise the first bare number — so
+    // "90 tax 8.8%" works without a currency symbol.
+    let (price, currency) = match s.prices.first() {
+        Some(&(p, cur)) => (p, Some(cur)),
+        None => (*s.numbers.first()?, None),
+    };
+
+    // Rate: prefer an explicit percent token ("7%"), otherwise read it from
+    // the next bare number so "10 tax 7" reads as 10 + 7%.
+    let percent = match s.percents.first() {
+        Some(&p) => p,
+        None => {
+            let rate_idx = if s.prices.is_empty() { 1 } else { 0 };
+            *s.numbers.get(rate_idx)?
+        }
+    };
+
     Some(Latent::PercentPrice {
         price,
-        percent: s.percents[0],
+        percent,
         dir,
-        currency: Some(cur),
+        currency,
         side: s.side,
     })
 }
@@ -585,15 +684,57 @@ mod tests {
 
     #[test]
     fn natural_language_subtraction() {
-        // "I have 2 dogs and one died" -> 2 - 1 = 1 remains.
+        // "I have 2 dogs and one died" -> 2 - 1 = 1 remains, noun retained.
         assert_eq!(
             run("I have 2 dogs and one is die").unwrap().to_sentence(),
-            "difference is 1"
+            "difference is 1 dog"
         );
         assert_eq!(
             run("5 apples lost 2").unwrap().to_sentence(),
-            "difference is 3"
+            "difference is 3 apples"
         );
+    }
+
+    #[test]
+    fn noun_retained_in_answer() {
+        // The result carries the subject noun, singular when the count is 1.
+        assert_eq!(
+            run("I have 2 dogs and one dog is dead.")
+                .unwrap()
+                .to_sentence(),
+            "difference is 1 dog"
+        );
+    }
+
+    #[test]
+    fn tax_and_discount_on_bare_numbers() {
+        // Bare base (no currency symbol): the core transcript bug.
+        assert_eq!(run("10 tax 7%").unwrap().to_sentence(), "result is 10.7");
+        assert_eq!(run("90 tax 8.8%").unwrap().to_sentence(), "result is 97.92");
+        assert_eq!(
+            run("iphone 30211 vat 10%").unwrap().to_sentence(),
+            "result is 33232.1"
+        );
+        assert_eq!(
+            run("5 discount 10%").unwrap().to_sentence(),
+            "result is 4.5"
+        );
+    }
+
+    #[test]
+    fn tax_without_percent_symbol() {
+        // "10 tax 7" reads the trailing number as the rate.
+        assert_eq!(run("10 tax 7").unwrap().to_sentence(), "result is 10.7");
+    }
+
+    #[test]
+    fn thousands_separators_and_glued_keyword() {
+        // Recovered inside the transformer (tokenizer untouched).
+        assert_eq!(
+            run("iphone 30,211 vat 10%").unwrap().to_sentence(),
+            "result is 33232.1"
+        );
+        assert_eq!(run("90tax 8.8%").unwrap().to_sentence(), "result is 97.92");
     }
 
     #[test]

@@ -82,7 +82,7 @@ fn natural_language_subtraction_dogs() {
         Calculator::parse("I have 2 dogs and one is die")
             .unwrap()
             .to_sentence(),
-        "difference is 1"
+        "difference is 1 dog"
     );
 }
 

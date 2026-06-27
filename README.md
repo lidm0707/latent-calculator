@@ -92,7 +92,7 @@ the sentence to the client — no WASM bundle cost for the math.
 | `5 plus 3` | `sum is 8` | arithmetic |
 | `10$ discount 2%` | `result is 9.8$` | percent-price |
 | `2 buy 1` | `sum is 3` | NL word → `+` |
-| `I have 2 dogs and one is die` | `difference is 1` | NL word → `−` (death/loss verb) |
+| `I have 2 dogs and one is die` | `difference is 1 dog` | NL word → `−` (death/loss verb), noun retained |
 | `double 15` | `product is 30` | NL word → `×2` |
 | `\frac{6}{2}` | `quotient is 3` | LaTeX division |
 | `\sqrt[3]{27}` | `root is 3` | LaTeX k-th root |
@@ -191,7 +191,7 @@ total is 60$
 > 10$ discount 2%
 result is 9.8$
 > I have 2 dogs and one is die
-difference is 1
+difference is 1 dog
 > \sqrt[3]{27}
 root is 3
 ```
@@ -199,7 +199,7 @@ root is 3
 ## Build & test
 
 ```sh
-cargo test     -p latent-calculator        # 31 tests (22 unit + 9 integration), no flags
+cargo test     -p latent-calculator        # 35 tests (26 unit + 9 integration), no flags
 cargo clippy   -p latent-calculator --all-targets
 ```
 
